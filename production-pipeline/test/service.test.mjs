@@ -521,6 +521,8 @@ describe('production pipeline console service', () => {
 
     await waitForFile(markerOne)
     await waitForFile(markerTwo)
+    await waitForJobStatus(app, 'queue-one', 'completed')
+    await waitForJobStatus(app, 'queue-two', 'completed')
     const after = (await app.inject({ method: 'GET', url: '/api/jobs' })).json()
     assert.equal(after.jobs.filter((job) => (job.id === 'queue-one' || job.id === 'queue-two') && job.status === 'completed').length, 2)
   })

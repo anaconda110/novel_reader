@@ -1063,11 +1063,12 @@ async function runSummary(options) {
   const startedAt = new Date().toISOString()
 
   try {
-    const concurrency = clampInteger(options.concurrency, 4, 1, 32)
+    const concurrency = normalizeStageConcurrency(options.concurrency, model, 4)
     const limit = clampInteger(options.limit, 0, 0, Number.MAX_SAFE_INTEGER)
     const timeoutMs = clampInteger(options.timeoutMs, 300_000, 1_000, 900_000)
     const maxAttempts = clampInteger(options.maxAttempts || options.retries, 3, 1, 10)
     const force = isFlagEnabled(options.force)
+    const selectedChapterIds = parseChapterIdsOption(options.chapterIds, 'summary')
     const llmConfig = {
       provider,
       model,
@@ -1086,7 +1087,7 @@ async function runSummary(options) {
     const db = await openMainDbForSummary(mainDbPath)
     let targets
     try {
-      targets = readSummaryTargets(db, { bookId, force, limit })
+      targets = readSummaryTargets(db, { bookId, force, limit, selectedChapterIds })
     } finally {
       db.close()
     }
@@ -1095,6 +1096,7 @@ async function runSummary(options) {
       completed: 0,
       failed: 0,
       total: targets.length,
+      changedChapterIds: [],
       errors: [],
     }
     const progress = createStageProgressLogger({
@@ -1113,7 +1115,8 @@ async function runSummary(options) {
           const summary = await generateChapterSummary(chapter, llmConfig)
           const writeDb = await openMainDbForSummary(mainDbPath)
           try {
-            writeSummary(writeDb, chapter.id, summary)
+            const writeResult = writeSummary(writeDb, chapter.id, summary)
+            if (writeResult.changed) results.changedChapterIds.push(chapter.id)
           } finally {
             writeDb.close()
           }
@@ -1131,6 +1134,7 @@ async function runSummary(options) {
       })
     }
     progress.finish()
+    results.changedChapterIds.sort()
 
     const finishedAt = new Date().toISOString()
     const report = {
@@ -1141,6 +1145,7 @@ async function runSummary(options) {
       model,
       concurrency,
       force,
+      selectedChapterIds: selectedChapterIds || [],
       dryRun: isFlagEnabled(options.dryRun),
       targetChapters: targets.length,
       ...results,
@@ -1184,6 +1189,7 @@ async function runSummary(options) {
     console.log(`summary targets: ${targets.length}`)
     console.log(`completed: ${results.completed}`)
     console.log(`failed: ${results.failed}`)
+    console.log(`changed: ${results.changedChapterIds.length}`)
     console.log(`report: ${reportPath}`)
     console.log(`runDir: ${run.rootDir}`)
     if (isFlagEnabled(options.dryRun)) console.log('dry-run: summaries were not generated or written')
@@ -1221,11 +1227,12 @@ async function runSummaryLocate(options) {
   const startedAt = new Date().toISOString()
 
   try {
-    const concurrency = clampInteger(options.concurrency, 4, 1, 32)
+    const concurrency = normalizeStageConcurrency(options.concurrency, model, 4)
     const limit = clampInteger(options.limit, 0, 0, Number.MAX_SAFE_INTEGER)
     const timeoutMs = clampInteger(options.timeoutMs, 300_000, 1_000, 900_000)
     const maxAttempts = clampInteger(options.maxAttempts || options.retries, 3, 1, 10)
     const force = isFlagEnabled(options.force)
+    const selectedChapterIds = parseChapterIdsOption(options.chapterIds, 'summary-locate')
     const llmConfig = {
       provider,
       model,
@@ -1242,7 +1249,7 @@ async function runSummaryLocate(options) {
     const db = await openMainDbForSummary(mainDbPath)
     let targets
     try {
-      targets = readSummaryLocateTargets(db, { bookId, force, limit })
+      targets = readSummaryLocateTargets(db, { bookId, force, limit, selectedChapterIds })
     } finally {
       db.close()
     }
@@ -1294,6 +1301,11 @@ async function runSummaryLocate(options) {
       schemaVersion: 1,
       generatedAt: finishedAt,
       bookId,
+      provider,
+      model,
+      concurrency,
+      force,
+      selectedChapterIds: selectedChapterIds || [],
       dryRun: isFlagEnabled(options.dryRun),
       targets: results.total,
       completed: results.completed,
@@ -1366,11 +1378,12 @@ async function runKg(options) {
   const startedAt = new Date().toISOString()
 
   try {
-    const concurrency = clampInteger(options.concurrency, 3, 1, 16)
+    const concurrency = normalizeStageConcurrency(options.concurrency, model, 3)
     const limit = clampInteger(options.limit, 0, 0, Number.MAX_SAFE_INTEGER)
     const timeoutMs = clampInteger(options.timeoutMs, 600_000, 1_000, 900_000)
     const maxAttempts = clampInteger(options.maxAttempts || options.retries, 3, 1, 10)
     const force = isFlagEnabled(options.force)
+    const selectedChapterIds = parseChapterIdsOption(options.chapterIds, 'kg')
     const qualityOptions = {
       emptyMinChars: clampInteger(options.emptyMinChars, 1000, 0, Number.MAX_SAFE_INTEGER),
       allowEmpty: isFlagEnabled(options.allowEmptyKg),
@@ -1390,7 +1403,7 @@ async function runKg(options) {
     const db = await openMainDbForKg(mainDbPath)
     let targets
     try {
-      targets = readKgTargets(db, { bookId, force, limit })
+      targets = readKgTargets(db, { bookId, force, limit, selectedChapterIds })
     } finally {
       db.close()
     }
@@ -1473,6 +1486,7 @@ async function runKg(options) {
         retries: results.qualityRetries,
       },
       force,
+      selectedChapterIds: selectedChapterIds || [],
       dryRun: isFlagEnabled(options.dryRun),
       targetChapters: targets.length,
       ...results,
@@ -2630,8 +2644,8 @@ function normalizeKgExtractionQualityRow(row) {
     contentLength: String(row.content || '').trim().length,
     status: String(row.status || ''),
     error: row.error ? String(row.error) : '',
-    entityCount: safeArray(extraction.entities).length,
-    relationCount: safeArray(extraction.relations).length,
+    entityCount: safeArray(extraction?.entities).length,
+    relationCount: safeArray(extraction?.relations).length,
   }
 }
 
@@ -2647,6 +2661,7 @@ function buildPackageQualityReport(book, bookPackage, options = {}) {
   const completedKgChapterIds = new Set(safeArray(kgExtraction.completed).map((row) => String(row.chapterId || '')).filter(Boolean))
   const missingKgMentionChapters = [...completedKgChapterIds]
     .filter((chapterId) => chapterIds.has(chapterId) && !kgMentionedChapterIds.has(chapterId))
+    .filter((chapterId) => !isTitleOnlyChapter(chapterById.get(chapterId)))
     .map((chapterId) => {
       const chapter = chapterById.get(chapterId) || {}
       return {
@@ -2914,7 +2929,43 @@ function ensureSummarySchema(db) {
   }
 }
 
-function readSummaryTargets(db, { bookId, force, limit }) {
+function validateSelectedChapterIds(db, bookId, selectedChapterIds, commandName) {
+  const placeholders = selectedChapterIds.map(() => '?').join(', ')
+  const selectedRows = db.prepare(`
+    SELECT id, book_id AS bookId
+    FROM chapters
+    WHERE id IN (${placeholders})
+  `).all(...selectedChapterIds).map(plainObject)
+  const selectedById = new Map(selectedRows.map((row) => [row.id, row]))
+  const invalidChapterIds = selectedChapterIds.filter((chapterId) => {
+    const row = selectedById.get(chapterId)
+    return !row || row.bookId !== bookId
+  })
+  if (invalidChapterIds.length > 0) {
+    throw new Error(`${commandName} --chapter-ids contains chapters that do not exist in book ${bookId}: ${invalidChapterIds.join(', ')}`)
+  }
+}
+
+function readSummaryTargets(db, { bookId, force, limit, selectedChapterIds = null }) {
+  if (selectedChapterIds) {
+    validateSelectedChapterIds(db, bookId, selectedChapterIds, 'summary')
+    const placeholders = selectedChapterIds.map(() => '?').join(', ')
+    const rows = db.prepare(`
+      SELECT
+        c.id,
+        c.book_id AS bookId,
+        c.chapter_index AS chapterIndex,
+        c.title,
+        c.content,
+        c.word_count AS wordCount
+      FROM chapters c
+      WHERE c.book_id = ?
+        AND c.id IN (${placeholders})
+      ORDER BY c.chapter_index, c.title
+    `).all(bookId, ...selectedChapterIds).map(plainObject)
+    return limit > 0 ? rows.slice(0, limit) : rows
+  }
+
   const rows = db.prepare(`
     SELECT
       c.id,
@@ -2932,8 +2983,45 @@ function readSummaryTargets(db, { bookId, force, limit }) {
   return limit > 0 ? rows.slice(0, limit) : rows
 }
 
-function readSummaryLocateTargets(db, { bookId, force, limit }) {
+function readSummaryLocateTargets(db, { bookId, force, limit, selectedChapterIds = null }) {
   ensureSummarySchema(db)
+  if (selectedChapterIds) {
+    validateSelectedChapterIds(db, bookId, selectedChapterIds, 'summary-locate')
+    const placeholders = selectedChapterIds.map(() => '?').join(', ')
+    const rows = db.prepare(`
+      SELECT
+        c.id AS chapterId,
+        c.book_id AS bookId,
+        c.chapter_index AS chapterIndex,
+        c.title,
+        c.content,
+        c.word_count AS wordCount,
+        s.key_points_json AS keyPointsJson,
+        s.key_point_sources_json AS keyPointSourcesJson
+      FROM chapters c
+      LEFT JOIN summaries s ON s.chapter_id = c.id
+      WHERE c.book_id = ?
+        AND c.id IN (${placeholders})
+      ORDER BY c.chapter_index, c.title
+    `).all(bookId, ...selectedChapterIds).map(plainObject)
+    const missingSummaries = rows
+      .filter((row) => row.keyPointsJson === null || row.keyPointsJson === undefined)
+      .map((row) => row.chapterId)
+    if (missingSummaries.length > 0) {
+      throw new Error(`summary-locate --chapter-ids contains chapters without summaries in book ${bookId}: ${missingSummaries.join(', ')}`)
+    }
+    const invalidKeyPointChapters = rows
+      .filter((row) => {
+        const keyPoints = safeJsonParse(row.keyPointsJson, null)
+        return !Array.isArray(keyPoints) || keyPoints.map(String).filter(Boolean).length === 0
+      })
+      .map((row) => row.chapterId)
+    if (invalidKeyPointChapters.length > 0) {
+      throw new Error(`summary-locate --chapter-ids contains chapters without non-empty key points in book ${bookId}: ${invalidKeyPointChapters.join(', ')}`)
+    }
+    return limit > 0 ? rows.slice(0, limit) : rows
+  }
+
   const rows = db.prepare(`
     SELECT
       c.id AS chapterId,
@@ -2959,6 +3047,26 @@ function readSummaryLocateTargets(db, { bookId, force, limit }) {
 }
 
 function writeSummary(db, chapterId, summary) {
+  ensureSummarySchema(db)
+  const short = String(summary.short || '')
+  const detail = String(summary.detail || '')
+  const keyPointsJson = JSON.stringify(summary.keyPoints)
+  const skippable = String(summary.skippable || '')
+  const existing = db.prepare(`
+    SELECT short, detail, key_points_json AS keyPointsJson, skippable
+    FROM summaries
+    WHERE chapter_id = ?
+  `).get(chapterId)
+  if (
+    existing
+    && String(existing.short) === short
+    && String(existing.detail) === detail
+    && String(existing.keyPointsJson) === keyPointsJson
+    && String(existing.skippable) === skippable
+  ) {
+    return { changed: false }
+  }
+
   db.prepare(`
     INSERT INTO summaries (chapter_id, short, detail, key_points_json, key_point_sources_json, skippable, generated_by, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -2972,13 +3080,14 @@ function writeSummary(db, chapterId, summary) {
       updated_at = CURRENT_TIMESTAMP
   `).run(
     chapterId,
-    summary.short,
-    summary.detail,
-    JSON.stringify(summary.keyPoints),
-    JSON.stringify(normalizeSummaryKeyPointSources(summary.keyPointSources, summary.keyPoints)),
-    summary.skippable,
+    short,
+    detail,
+    keyPointsJson,
+    '[]',
+    skippable,
     summary.generatedBy,
   )
+  return { changed: true }
 }
 
 function writeSummaryKeyPointSources(db, chapterId, keyPointSources) {
@@ -3073,7 +3182,27 @@ function ensureKgSchema(db) {
   ensureSqliteColumn(db, 'kg_relations', 'review_status', 'TEXT')
 }
 
-function readKgTargets(db, { bookId, force, limit }) {
+function readKgTargets(db, { bookId, force, limit, selectedChapterIds = null }) {
+  if (selectedChapterIds) {
+    validateSelectedChapterIds(db, bookId, selectedChapterIds, 'kg')
+    const placeholders = selectedChapterIds.map(() => '?').join(', ')
+
+    const rows = db.prepare(`
+      SELECT
+        c.id,
+        c.book_id AS bookId,
+        c.chapter_index AS chapterIndex,
+        c.title,
+        c.content,
+        c.word_count AS wordCount
+      FROM chapters c
+      WHERE c.book_id = ?
+        AND c.id IN (${placeholders})
+      ORDER BY c.chapter_index, c.title
+    `).all(bookId, ...selectedChapterIds).map(plainObject)
+    return limit > 0 ? rows.slice(0, limit) : rows
+  }
+
   const rows = db.prepare(`
     SELECT
       c.id,
@@ -4133,6 +4262,10 @@ function buildStageArgs(stage, job, mainDbPath, runInfo, stageOptions = {}) {
     if (summary.timeoutMs) args.push('--timeout-ms', String(summary.timeoutMs))
     if (summary.maxAttempts || summary.retries) args.push('--max-attempts', String(summary.maxAttempts || summary.retries))
     if (summary.limit) args.push('--limit', String(summary.limit))
+    if (summary.chapterIds || summary.chapter_ids) {
+      const chapterIds = summary.chapterIds || summary.chapter_ids
+      args.push('--chapter-ids', Array.isArray(chapterIds) ? chapterIds.join(',') : String(chapterIds))
+    }
     if (isFlagEnabled(summary.force)) args.push('--force')
     if (summary.thinkingEnabled === false || isFlagEnabled(summary.disableThinking)) args.push('--disable-thinking')
     return args.filter((arg) => arg !== '')
@@ -4158,6 +4291,10 @@ function buildStageArgs(stage, job, mainDbPath, runInfo, stageOptions = {}) {
     if (summaryLocate.timeoutMs) args.push('--timeout-ms', String(summaryLocate.timeoutMs))
     if (summaryLocate.maxAttempts || summaryLocate.retries) args.push('--max-attempts', String(summaryLocate.maxAttempts || summaryLocate.retries))
     if (summaryLocate.limit) args.push('--limit', String(summaryLocate.limit))
+    if (summaryLocate.chapterIds || summaryLocate.chapter_ids) {
+      const chapterIds = summaryLocate.chapterIds || summaryLocate.chapter_ids
+      args.push('--chapter-ids', Array.isArray(chapterIds) ? chapterIds.join(',') : String(chapterIds))
+    }
     if (isFlagEnabled(summaryLocate.force)) args.push('--force')
     if (summaryLocate.thinkingEnabled === false || isFlagEnabled(summaryLocate.disableThinking)) args.push('--disable-thinking')
     return args.filter((arg) => arg !== '')
@@ -4183,6 +4320,10 @@ function buildStageArgs(stage, job, mainDbPath, runInfo, stageOptions = {}) {
     if (kg.timeoutMs) args.push('--timeout-ms', String(kg.timeoutMs))
     if (kg.maxAttempts || kg.retries) args.push('--max-attempts', String(kg.maxAttempts || kg.retries))
     if (kg.limit) args.push('--limit', String(kg.limit))
+    if (kg.chapterIds || kg.chapter_ids) {
+      const chapterIds = kg.chapterIds || kg.chapter_ids
+      args.push('--chapter-ids', Array.isArray(chapterIds) ? chapterIds.join(',') : String(chapterIds))
+    }
     if (kg.contentLimit || kg.content_limit) args.push('--content-limit', String(kg.contentLimit || kg.content_limit))
     if (kg.entityLimit || kg.entity_limit) args.push('--entity-limit', String(kg.entityLimit || kg.entity_limit))
     if (kg.relationLimit || kg.relation_limit) args.push('--relation-limit', String(kg.relationLimit || kg.relation_limit))
@@ -4800,11 +4941,19 @@ async function callOpenAICompatibleChat(messages, config) {
     model: config.model,
     messages,
     temperature: config.temperature ?? 0,
-    response_format: { type: 'json_object' },
   }
-  if (config.thinkingEnabled === false) {
-    body.extra_body = { enable_thinking: false }
-    body.chat_template_kwargs = { enable_thinking: false }
+  // 模型感知的 thinking/json 格式：
+  // - sensenova-* 系列需要 reasoning_effort=none 且不能带 response_format
+  //   (response_format 会干扰 reasoning_effort，导致全部输出被推理消耗)
+  // - glm-*/qwen-*/deepseek-* 使用 response_format=json_object + thinking.type=disabled
+  const modelName = String(config.model || '').toLowerCase()
+  if (modelName.includes('sensenova')) {
+    if (config.thinkingEnabled === false) body.reasoning_effort = 'none'
+  } else {
+    body.response_format = { type: 'json_object' }
+    if (config.thinkingEnabled === false) {
+      body.thinking = { type: 'disabled' }
+    }
   }
   let response
   try {
@@ -5008,6 +5157,13 @@ function isReferenceLikeChapterContent(content) {
   const referenceChars = text.match(/[\d\s.,;:()\[\]{}\-—–_/\\|]+/g)?.join('').length ?? 0
   const referenceRatio = compact.length ? referenceChars / compact.length : 0
   return proseCount < 24 && digitCount >= 40 && referenceRatio >= 0.7
+}
+
+function isTitleOnlyChapter(chapter) {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim()
+  const title = normalize(chapter?.title)
+  const content = normalize(chapter?.content)
+  return title.length > 0 && content === title
 }
 
 function normalizeKgEntity(entity) {
@@ -5324,6 +5480,30 @@ function clampInteger(value, fallback, min, max) {
   return Math.max(min, Math.min(max, Math.floor(number)))
 }
 
+function normalizeStageConcurrency(value, model, fallback) {
+  const requested = clampInteger(value, fallback, 1, 18)
+  const normalized = String(model).trim().toLowerCase()
+  if (normalized.includes('glm') || normalized.includes('sensenova')) {
+    return Math.min(requested, 8)
+  }
+  return requested
+}
+
+function parseChapterIdsOption(value, commandName) {
+  if (value === undefined) return null
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`${commandName} --chapter-ids requires a non-empty comma-separated list of chapter IDs`)
+  }
+  const chapterIds = value.split(',').map((chapterId) => chapterId.trim())
+  if (chapterIds.some((chapterId) => !chapterId)) {
+    throw new Error(`${commandName} --chapter-ids must not contain empty chapter IDs`)
+  }
+  if (new Set(chapterIds).size !== chapterIds.length) {
+    throw new Error(`${commandName} --chapter-ids must not contain duplicate chapter IDs`)
+  }
+  return chapterIds
+}
+
 function isFlagEnabled(value) {
   if (value === undefined || value === null || value === false) return false
   if (value === true) return true
@@ -5533,9 +5713,10 @@ Usage:
   npm run production-pipeline -- resume --run <runId|runDir|run.json>
   npm run production-pipeline -- import --file <path> [--book-id <id>] [--title <title>] [--dry-run] [--replace]
   npm run production-pipeline -- package --book-id <id>
-  npm run production-pipeline -- summary --book-id <id> --provider <openai|ollama> --base-url <url> --model <name>
-  npm run production-pipeline -- summary-locate --book-id <id> --provider <openai|ollama> --base-url <url> --model <name>
-  npm run production-pipeline -- kg --book-id <id> --provider <openai|ollama> --base-url <url> --model <name>
+  npm run production-pipeline -- summary --book-id <id> --provider <openai|ollama> --base-url <url> --model <name> [--chapter-ids <chapter-id,...>]
+  npm run production-pipeline -- summary-locate --book-id <id> --provider <openai|ollama> --base-url <url> --model <name> [--chapter-ids <chapter-id,...>]
+  npm run production-pipeline -- kg --book-id <id> --provider <openai|ollama> --base-url <url> --model <name> [--chapter-ids <chapter-id,...>]
+       [--concurrency <1-18; GLM/SenseNova max 8>]
   npm run production-pipeline -- audio --book-id <id> --source-root <path>
   npm run production-pipeline -- audio --book-id <id> --tts-config <path> [--chapters 1-10]
   npm run production-pipeline -- embedding --book-id <id> --provider <ollama|openai> --base-url <url> --model <name> [--mode all|chunks|summaries]
@@ -5554,6 +5735,7 @@ Options:
   --gateway-admin-token Gateway admin bearer token for optional verify refresh checks.
   --audio-samples      Number of audio chapters whose manifest/download should be sampled in verify. Default: 1.
   --concurrency        Summary/KG/embedding request concurrency.
+  --chapter-ids        summary, summary-locate and kg: explicit comma-separated chapter IDs to regenerate, including completed chapters.
   --empty-min-chars    KG quality gate: empty extraction fails at or above this chapter content length. Default: 1000.
   --allow-empty-kg     Allow KG to complete with an empty extraction for non-trivial chapters.
   --allow-quality-issues Allow package to write artifacts even when quality checks fail.

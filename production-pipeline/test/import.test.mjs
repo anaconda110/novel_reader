@@ -423,6 +423,125 @@ describe('production-pipeline import', () => {
     }
   })
 
+  it('writes a quality report when a failed KG extraction has null JSON', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'production-pipeline-package-null-kg-test-'))
+    try {
+      const txtPath = join(tempDir, 'sample.txt')
+      const dbPath = join(tempDir, 'main.sqlite')
+      const runRoot = join(tempDir, 'runs')
+      await writeFile(txtPath, `第一章 开始\n这是第一章内容。\n\n第二章 继续\n这是第二章内容。`, 'utf8')
+      await execFileAsync(process.execPath, [
+        cliPath,
+        'import',
+        '--file',
+        txtPath,
+        '--book-id',
+        'sample-book',
+        '--title',
+        '样书',
+        '--main-db',
+        dbPath,
+        '--run-root',
+        runRoot,
+      ])
+      seedSummaries(dbPath)
+      seedEmbeddings(dbPath)
+      seedKnowledgeGraph(dbPath)
+      seedKgChapterExtractions(dbPath, [
+        ['sample-book:ch00001', { entities: [{ name: '阿甲' }], relations: [] }],
+        ['sample-book:ch00002', null, { status: 'failed', error: '400 Bad Request' }],
+      ])
+
+      await assert.rejects(
+        execFileAsync(process.execPath, [
+          cliPath,
+          'package',
+          '--book-id',
+          'sample-book',
+          '--main-db',
+          dbPath,
+          '--run-root',
+          runRoot,
+        ]),
+        (error) => {
+          assert.match(error.stderr, /Package quality gate failed/)
+          assert.match(error.stderr, /1 KG extraction\(s\) are failed/)
+          return true
+        },
+      )
+
+      const runIds = await readdir(join(runRoot, 'sample-book'))
+      assert.equal(runIds.length, 1)
+      const runDir = join(runRoot, 'sample-book', runIds[0])
+      const runJson = JSON.parse(await readFile(join(runDir, 'run.json'), 'utf8'))
+      assert.equal(runJson.status, 'failed')
+      const qualityReport = JSON.parse(await readFile(join(runDir, runJson.stages.package.artifacts.qualityReport), 'utf8'))
+      assert.equal(qualityReport.status, 'failed')
+      const failedExtractions = qualityReport.errors.find((issue) => issue.code === 'kg_failed_extractions')
+      assert.ok(failedExtractions)
+      assert.deepEqual(
+        failedExtractions.chapters.map((chapter) => chapter.chapterId),
+        ['sample-book:ch00002'],
+      )
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('ignores title-only shell chapters when checking KG mention coverage', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'production-pipeline-package-title-only-test-'))
+    try {
+      const txtPath = join(tempDir, 'sample.txt')
+      const dbPath = join(tempDir, 'main.sqlite')
+      const runRoot = join(tempDir, 'runs')
+      await writeFile(txtPath, `第一章 开始\n这是第一章内容。\n\n第二章 继续\n这是第二章内容。`, 'utf8')
+      await execFileAsync(process.execPath, [
+        cliPath,
+        'import',
+        '--file',
+        txtPath,
+        '--book-id',
+        'sample-book',
+        '--title',
+        '样书',
+        '--main-db',
+        dbPath,
+        '--run-root',
+        runRoot,
+      ])
+      makeChapterTitleOnly(dbPath, 'sample-book:ch00002', '第二章 继续')
+      seedSummaries(dbPath)
+      seedEmbeddings(dbPath)
+      seedKnowledgeGraph(dbPath)
+      seedKgChapterExtractions(dbPath, [
+        ['sample-book:ch00001', { entities: [{ name: '阿甲' }], relations: [] }],
+        ['sample-book:ch00002', { entities: [], relations: [] }],
+      ])
+
+      await execFileAsync(process.execPath, [
+        cliPath,
+        'package',
+        '--book-id',
+        'sample-book',
+        '--main-db',
+        dbPath,
+        '--run-root',
+        runRoot,
+      ])
+
+      const runIds = await readdir(join(runRoot, 'sample-book'))
+      assert.equal(runIds.length, 1)
+      const runDir = join(runRoot, 'sample-book', runIds[0])
+      const runJson = JSON.parse(await readFile(join(runDir, 'run.json'), 'utf8'))
+      assert.equal(runJson.status, 'completed')
+      const qualityReport = JSON.parse(await readFile(join(runDir, runJson.stages.package.artifacts.qualityReport), 'utf8'))
+      assert.equal(qualityReport.status, 'passed')
+      assert.deepEqual(qualityReport.errors, [])
+    } finally {
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
   it('prepares a dry-run publish plan and merged Gateway catalog', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), 'production-pipeline-publish-test-'))
     try {
@@ -918,6 +1037,67 @@ describe('production-pipeline import', () => {
       assert.equal(kgReport.concurrency, 2)
     } finally {
       if (chatServer) await chatServer.close()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('caps GLM and SenseNova kg concurrency at 8', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'production-pipeline-model-concurrency-cap-test-'))
+    let chatServer
+    try {
+      chatServer = await startFakeChatServer()
+      const txtPath = join(tempDir, 'sample.txt')
+      const dbPath = join(tempDir, 'main.sqlite')
+      const runRoot = join(tempDir, 'runs')
+      await writeFile(txtPath, '第一章 开始\n阿甲在长安帮助乙门。', 'utf8')
+      await execFileAsync(process.execPath, [
+        cliPath,
+        'import',
+        '--file',
+        txtPath,
+        '--book-id',
+        'sample-book',
+        '--title',
+        '样书',
+        '--main-db',
+        dbPath,
+        '--run-root',
+        runRoot,
+      ])
+
+      for (const model of ['glm-5.2', 'sensenova-6.8-flash-lite']) {
+        const { stdout } = await execFileAsync(process.execPath, [
+          cliPath,
+          'kg',
+          '--book-id',
+          'sample-book',
+          '--main-db',
+          dbPath,
+          '--run-root',
+          runRoot,
+          '--provider',
+          'openai-compatible',
+          '--base-url',
+          chatServer.url,
+          '--model',
+          model,
+          '--concurrency',
+          '18',
+          '--chapter-ids',
+          'sample-book:ch00001',
+          '--empty-min-chars',
+          '1',
+          '--disable-thinking',
+        ])
+        const runId = stdout.match(/run: (.+)/)?.[1]?.trim()
+        assert.ok(runId)
+        const report = JSON.parse(await readFile(join(runRoot, 'sample-book', runId, 'artifacts', 'kg-report.json'), 'utf8'))
+        assert.equal(report.model, model)
+        assert.equal(report.concurrency, 8)
+        assert.equal(report.completed, 1)
+      }
+    } finally {
+      await chatServer?.close()
       await rm(tempDir, { recursive: true, force: true })
     }
   })
@@ -1648,6 +1828,160 @@ describe('production-pipeline import', () => {
         assert.equal(row.status, 'completed')
       } finally {
         db.close()
+      }
+    } finally {
+      await chatServer?.close()
+      await rm(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  it('regenerates only explicitly selected kg chapters and rejects unsafe selectors', async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), 'production-pipeline-kg-selected-chapters-test-'))
+    let chatServer
+    try {
+      chatServer = await startFakeChatServer()
+      const txtPath = join(tempDir, 'sample.txt')
+      const otherTxtPath = join(tempDir, 'other.txt')
+      const dbPath = join(tempDir, 'main.sqlite')
+      const runRoot = join(tempDir, 'runs')
+      await writeFile(
+        txtPath,
+        '第一章 开始\n阿甲在长安帮助乙门。\n\n第二章 继续\n阿甲再次来到长安。\n\n第三章 结束\n乙门在长安答谢阿甲。',
+        'utf8',
+      )
+      await writeFile(otherTxtPath, '第一章 别书\n别书人物在别处行动。', 'utf8')
+      for (const [file, bookId, title] of [
+        [txtPath, 'sample-book', '样书'],
+        [otherTxtPath, 'other-book', '别书'],
+      ]) {
+        await execFileAsync(process.execPath, [
+          cliPath,
+          'import',
+          '--file',
+          file,
+          '--book-id',
+          bookId,
+          '--title',
+          title,
+          '--main-db',
+          dbPath,
+          '--run-root',
+          runRoot,
+        ])
+      }
+
+      const baseArgs = [
+        cliPath,
+        'kg',
+        '--book-id',
+        'sample-book',
+        '--main-db',
+        dbPath,
+        '--run-root',
+        runRoot,
+        '--provider',
+        'openai-compatible',
+        '--base-url',
+        chatServer.url,
+        '--model',
+        'glm-5.2',
+        '--concurrency',
+        '18',
+        '--empty-min-chars',
+        '1',
+        '--disable-thinking',
+      ]
+
+      for (const [chapterIds, expectedError] of [
+        ['', /requires a non-empty comma-separated list/],
+        ['sample-book:ch00001,', /must not contain empty chapter IDs/],
+        ['sample-book:ch00001,sample-book:ch00001', /must not contain duplicate chapter IDs/],
+        ['sample-book:ch99999', /do not exist in book sample-book/],
+        ['other-book:ch00001', /do not exist in book sample-book/],
+      ]) {
+        await assert.rejects(
+          execFileAsync(process.execPath, [...baseArgs, '--chapter-ids', chapterIds]),
+          (error) => {
+            assert.match(error.stderr, expectedError)
+            return true
+          },
+        )
+      }
+      assert.equal(chatServer.requests.length, 0, 'invalid selectors must not call the LLM')
+
+      const { stdout: initialStdout } = await execFileAsync(process.execPath, baseArgs)
+      assert.match(initialStdout, /completed: 3/)
+      assert.equal(chatServer.requests.length, 3)
+
+      const db = new DatabaseSync(dbPath)
+      try {
+        db.prepare("UPDATE kg_chapter_extractions SET updated_at = '2000-01-01 00:00:00' WHERE book_id = ?")
+          .run('sample-book')
+      } finally {
+        db.close()
+      }
+
+      const readExtractions = () => {
+        const readDb = new DatabaseSync(dbPath, { readOnly: true })
+        try {
+          return readDb.prepare(`
+            SELECT
+              chapter_id AS chapterId,
+              status,
+              extraction_json AS extractionJson,
+              model,
+              updated_at AS updatedAt
+            FROM kg_chapter_extractions
+            WHERE book_id = ?
+            ORDER BY chapter_id
+          `).all('sample-book').map(plainRow)
+        } finally {
+          readDb.close()
+        }
+      }
+
+      const beforeSelective = readExtractions()
+      const selectedChapterId = 'sample-book:ch00002'
+      const { stdout: selectiveStdout } = await execFileAsync(process.execPath, [
+        ...baseArgs,
+        '--chapter-ids',
+        selectedChapterId,
+      ])
+      assert.match(selectiveStdout, /completed: 1/)
+      assert.equal(chatServer.requests.length, 4, 'only the selected chapter should be requested again')
+
+      const selectedPrompt = chatServer.requests.at(-1).messages
+        .map((message) => message.content)
+        .join('\n')
+      assert.match(selectedPrompt, /第二章 继续/)
+      assert.doesNotMatch(selectedPrompt, /第一章 开始|第三章 结束/)
+
+      const runId = selectiveStdout.match(/run: (.+)/)?.[1]?.trim()
+      assert.ok(runId)
+      const report = JSON.parse(await readFile(join(runRoot, 'sample-book', runId, 'artifacts', 'kg-report.json'), 'utf8'))
+      assert.equal(report.concurrency, 8)
+      assert.deepEqual(report.selectedChapterIds, [selectedChapterId])
+      assert.equal(report.targetChapters, 1)
+      assert.equal(report.completed, 1)
+      assert.equal(report.failed, 0)
+
+      const afterSelective = readExtractions()
+      assert.equal(afterSelective.length, 3)
+      const beforeById = new Map(beforeSelective.map((row) => [row.chapterId, row]))
+      for (const row of afterSelective) {
+        const before = beforeById.get(row.chapterId)
+        assert.ok(before)
+        if (row.chapterId !== selectedChapterId) {
+          assert.deepEqual(row, before, `unselected chapter ${row.chapterId} must remain unchanged`)
+          continue
+        }
+        assert.equal(row.status, 'completed')
+        assert.equal(row.model, 'glm-5.2')
+        assert.notEqual(row.updatedAt, before.updatedAt)
+        assert.equal(
+          createHash('sha256').update(row.extractionJson).digest('hex'),
+          createHash('sha256').update(before.extractionJson).digest('hex'),
+        )
       }
     } finally {
       await chatServer?.close()
@@ -2931,6 +3265,16 @@ function pruneSecondChapterGeneratedData(dbPath) {
   }
 }
 
+function makeChapterTitleOnly(dbPath, chapterId, title) {
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.prepare('UPDATE chapters SET title = ?, content = ?, word_count = ? WHERE id = ?')
+      .run(title, title, title.length, chapterId)
+  } finally {
+    db.close()
+  }
+}
+
 function seedKnowledgeGraph(dbPath) {
   const db = new DatabaseSync(dbPath)
   try {
@@ -3042,10 +3386,15 @@ function seedKgChapterExtractions(dbPath, entries) {
     `)
     const insert = db.prepare(`
       INSERT INTO kg_chapter_extractions (chapter_id, book_id, status, extraction_json, error, model, scanned_at, updated_at)
-      VALUES (?, 'sample-book', 'completed', ?, NULL, 'fake-chat', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      VALUES (?, 'sample-book', ?, ?, ?, 'fake-chat', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `)
-    for (const [chapterId, extraction] of entries) {
-      insert.run(chapterId, JSON.stringify(extraction))
+    for (const [chapterId, extraction, options = {}] of entries) {
+      insert.run(
+        chapterId,
+        options.status || 'completed',
+        extraction === null || extraction === undefined ? null : JSON.stringify(extraction),
+        options.error || null,
+      )
     }
   } finally {
     db.close()
